@@ -1,0 +1,537 @@
+use std::sync::Arc;
+
+use axum::{
+    body::{Body, Bytes},
+    http::HeaderMap,
+    response::Response,
+};
+use http_body_util::{BodyExt, StreamBody};
+use hyper::body::Frame;
+use rust_decimal::{Decimal, prelude::ToPrimitive};
+use serde_json::{Value, json};
+use tokio::sync::Mutex;
+
+use super::routes::Rewrite;
+use crate::ledger::{Ledger, WeeklyCredits, WeeklyWindow};
+
+/// Shared by handles for one outbound; never used as an accounting identity.
+#[derive(Default)]
+pub struct CachedWindow {
+    account: Option<Arc<str>>,
+    window: Option<WeeklyWindow>,
+}
+
+impl CachedWindow {
+    pub fn get(&self, account: Option<&str>, now: i64) -> Option<WeeklyWindow> {
+        self.window
+            .filter(|window| self.account.as_deref() == account && window.contains(now))
+    }
+
+    pub fn update(&mut self, account: Option<&str>, window: Option<WeeklyWindow>) {
+        self.account = account.map(Arc::from);
+        self.window = window;
+    }
+}
+
+pub fn weekly_window(value: &Value) -> Option<(&'static str, WeeklyWindow)> {
+    let limit = value.get("rate_limit")?;
+    for field in ["secondary_window", "primary_window"] {
+        let Some(window) = limit.get(field) else {
+            continue;
+        };
+        if window.get("limit_window_seconds").and_then(Value::as_i64) == Some(604800) {
+            let end = window.get("reset_at")?.as_i64()?;
+            return Some((
+                field,
+                WeeklyWindow {
+                    start: end.checked_sub(604800)?,
+                    end,
+                },
+            ));
+        }
+    }
+    None
+}
+
+/// Only successful account discovery and status reads need a response adapter.
+pub async fn rewrite(
+    ledger: &Ledger,
+    user: &str,
+    response: Response,
+    kind: Rewrite,
+    client_account: Option<&str>,
+    upstream_account: Option<&str>,
+    window_cache: &Mutex<CachedWindow>,
+) -> anyhow::Result<Response> {
+    if !response.status().is_success() {
+        return Ok(response);
+    }
+    anyhow::ensure!(
+        response
+            .headers()
+            .get("content-encoding")
+            .is_none_or(|v| v == "identity"),
+        "encoded account response"
+    );
+    let (mut parts, body) = response.into_parts();
+    let collected = http_body_util::Limited::new(body, 16 * 1024 * 1024)
+        .collect()
+        .await
+        .map_err(|_| anyhow::anyhow!("account response could not be read within size limit"))?;
+    let mut trailers = collected.trailers().cloned();
+    let bytes = collected.to_bytes();
+    let mut value: Value = serde_json::from_slice(&bytes)?;
+    let original = value.clone();
+    match kind {
+        Rewrite::Accounts => accounts(&mut value, client_account, upstream_account)?,
+        Rewrite::Usage => {
+            window_cache.lock().await.update(
+                upstream_account,
+                weekly_window(&value).map(|(_, window)| window),
+            );
+            let WeeklyCredits::Limited(allowance) = ledger.weekly_credits(user)? else {
+                anyhow::bail!("unlimited status must use passthrough observation");
+            };
+            usage(
+                ledger,
+                user,
+                &mut value,
+                allowance,
+                chrono::Utc::now().timestamp(),
+            )
+            .await?
+        }
+    }
+    let bytes = if value != original {
+        invalidate_body_headers(&mut parts.headers);
+        parts.headers.insert("cache-control", "no-store".parse()?);
+        if let Some(headers) = &mut trailers {
+            invalidate_body_headers(headers);
+        }
+        Bytes::from(serde_json::to_vec(&value)?)
+    } else {
+        bytes
+    };
+    let body = if let Some(trailers) = trailers {
+        Body::new(StreamBody::new(futures_util::stream::iter([
+            Ok::<_, std::io::Error>(Frame::data(bytes)),
+            Ok(Frame::trailers(trailers)),
+        ])))
+    } else {
+        Body::from(bytes)
+    };
+    Ok(Response::from_parts(parts, body))
+}
+
+fn accounts(
+    value: &mut Value,
+    client_account: Option<&str>,
+    upstream_account: Option<&str>,
+) -> anyhow::Result<()> {
+    // Codex's map deserializer drops routing fields. Normalize maps to its list shape,
+    // retaining each entry's metadata, then adapt only the configured upstream account.
+    if let Some(map) = value.get("accounts").and_then(Value::as_object) {
+        let mut entries = Vec::new();
+        let mut references = std::collections::HashMap::new();
+        for (key, wrapper) in map {
+            let account = wrapper
+                .get("account")
+                .and_then(Value::as_object)
+                .ok_or_else(|| anyhow::anyhow!("invalid account discovery entry"))?;
+            let id = account
+                .get("account_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("missing upstream account id"))?;
+            references.insert(key.clone(), id.to_owned());
+            let mut entry = wrapper.as_object().cloned().unwrap_or_default();
+            entry.extend(account.clone());
+            entry.insert("id".into(), json!(id));
+            entries.push(Value::Object(entry));
+        }
+        for field in ["account_ordering", "default_account_id"] {
+            if let Some(field) = value.get_mut(field) {
+                remap_references(field, &references);
+            }
+        }
+        value["accounts"] = Value::Array(entries);
+    }
+    let requested = client_account.filter(|id| !id.trim().is_empty());
+    let selected = upstream_account
+        .map(str::to_owned)
+        .or_else(|| {
+            value
+                .get("default_account_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            let entries = value.get("accounts")?.as_array()?;
+            (entries.len() == 1)
+                .then(|| entries[0].get("id")?.as_str().map(str::to_owned))
+                .flatten()
+        })
+        .or_else(|| requested.map(str::to_owned))
+        .ok_or_else(|| anyhow::anyhow!("missing selected upstream account"))?;
+    let entries = value
+        .get_mut("accounts")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| anyhow::anyhow!("invalid account discovery response"))?;
+    let matched: Vec<_> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.get("id").and_then(Value::as_str) == Some(&selected))
+        .map(|(index, _)| index)
+        .collect();
+    anyhow::ensure!(
+        matched.len() == 1,
+        "missing or duplicate selected upstream account"
+    );
+    let alias = requested.unwrap_or(&selected);
+    anyhow::ensure!(
+        !entries
+            .iter()
+            .enumerate()
+            .any(|(i, entry)| i != matched[0]
+                && entry.get("id").and_then(Value::as_str) == Some(alias)),
+        "ambiguous client account alias"
+    );
+    let entry = &mut entries[matched[0]];
+    entry["id"] = json!(alias);
+    // Keep discovery inside the configured gateway instead of directing model traffic
+    // to a regional upstream origin that would bypass gateway authentication/accounting.
+    entry["workspace_backend_origin"] = json!("NO_CONSTRAINT");
+    if entry
+        .get("account_routing_override")
+        .is_none_or(Value::is_null)
+    {
+        entry["account_routing_override"] = json!("NO_CONSTRAINT");
+    }
+    let references = [(selected.clone(), alias.to_owned())].into_iter().collect();
+    for field in ["account_ordering", "default_account_id"] {
+        if let Some(value) = value.get_mut(field) {
+            remap_references(value, &references);
+        }
+    }
+    Ok(())
+}
+
+fn remap_references(value: &mut Value, mapping: &std::collections::HashMap<String, String>) {
+    match value {
+        Value::String(id) => {
+            if let Some(mapped) = mapping.get(id) {
+                *id = mapped.clone();
+            }
+        }
+        Value::Array(ids) => {
+            for id in ids {
+                remap_references(id, mapping);
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn usage(
+    ledger: &Ledger,
+    user: &str,
+    value: &mut Value,
+    allowance: Decimal,
+    now: i64,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(value.is_object(), "invalid usage response");
+    let mut reported = serde_json::Map::new();
+    if let Some(credits) = value.get("credits").and_then(Value::as_object) {
+        for field in ["has_credits", "unlimited", "balance"] {
+            if let Some(value) = credits.get(field) {
+                reported.insert(field.into(), value.clone());
+            }
+        }
+    }
+    if let Some(control) = value.get("spend_control") {
+        reported.insert("spend_control".into(), control.clone());
+    }
+    if !reported.is_empty() {
+        ledger
+            .record(user, None, Some(Value::Object(reported)))
+            .await?;
+    }
+
+    // These are optional display fields in RateLimitStatusPayload. Preserve permission
+    // flags and metadata; show only the local user's percentage in the weekly window.
+    if value.get("credits").is_some() {
+        value["credits"] = Value::Null;
+    }
+    let weekly = weekly_window(value)
+        .map(|(field, window)| (field, window, value["rate_limit"][field].clone()));
+    if let Some(limit) = value.get_mut("rate_limit") {
+        hide_windows(limit);
+        if let Some((field, bounds, mut window)) = weekly
+            && let Some(used) = ledger
+                .consumed_credits(user, bounds.start, bounds.end, now)
+                .await?
+            && let Some(percent) = used_percent(used, allowance)
+        {
+            // Keep the upstream window and reset metadata exactly as received.
+            window["used_percent"] = json!(percent);
+            limit[field] = window;
+        }
+    }
+    if let Some(additional) = value
+        .get_mut("additional_rate_limits")
+        .and_then(Value::as_array_mut)
+    {
+        for limit in additional {
+            if let Some(limit) = limit.get_mut("rate_limit") {
+                hide_windows(limit);
+            }
+        }
+    }
+    if let Some(control) = value
+        .get_mut("spend_control")
+        .and_then(Value::as_object_mut)
+        && let Some(limit) = control.get_mut("individual_limit")
+    {
+        *limit = Value::Null;
+    }
+    Ok(())
+}
+
+fn hide_windows(value: &mut Value) {
+    if let Some(object) = value.as_object_mut() {
+        for field in ["primary_window", "secondary_window"] {
+            if object.contains_key(field) {
+                object.insert(field.into(), Value::Null);
+            }
+        }
+    }
+}
+
+fn used_percent(used: Decimal, allowance: Decimal) -> Option<i32> {
+    if allowance.is_zero() || used >= allowance {
+        return Some(100);
+    }
+    used.checked_div(allowance)?
+        .checked_mul(Decimal::from(100))?
+        .round()
+        .to_i32()
+}
+
+pub fn invalidate_body_headers(headers: &mut HeaderMap) {
+    for name in [
+        "content-length",
+        "etag",
+        "content-md5",
+        "digest",
+        "content-digest",
+        "repr-digest",
+    ] {
+        headers.remove(name);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    #[test]
+    fn discovery_preserves_metadata_and_matches_saved_workspace_for_both_formats() {
+        let selected = json!({"id":"upstream", "plan_type":"team", "name":"Engineering",
+            "structure":"workspace", "profile_picture_url":"https://example.invalid/icon",
+            "workspace_backend_origin":"https://us.chatgpt.com", "account_routing_override":"us",
+            "features":{"future_field":true}});
+        let other = json!({"id":"other", "name":"Personal", "plan_type":"plus"});
+        let original = json!({"accounts":[selected,other], "default_account_id":"upstream",
+            "account_ordering":["other","upstream"], "extra":"untouched"});
+        let mut value = original.clone();
+        accounts(&mut value, Some("saved-in-auth-json"), Some("upstream")).unwrap();
+        let mut expected = original.clone();
+        expected["accounts"][0]["id"] = json!("saved-in-auth-json");
+        expected["accounts"][0]["workspace_backend_origin"] = json!("NO_CONSTRAINT");
+        expected["default_account_id"] = json!("saved-in-auth-json");
+        expected["account_ordering"][1] = json!("saved-in-auth-json");
+        assert_eq!(value, expected);
+        assert!(accounts(&mut original.clone(), Some("other"), Some("upstream")).is_err());
+        assert!(accounts(&mut original.clone(), Some("saved"), Some("missing")).is_err());
+
+        let mut value = json!({"accounts":{
+            "workspace-key":{"account":{"account_id":"upstream", "plan_type":"team", "name":"Engineering", "structure":"workspace"}, "entitlement":{"enabled":true}},
+            "personal-key":{"account":{"account_id":"personal", "plan_type":"plus"}}
+        }, "account_ordering":["workspace-key","personal-key"], "default_account_id":"workspace-key"});
+        accounts(&mut value, Some("saved"), Some("upstream")).unwrap();
+        let entries = value["accounts"].as_array().unwrap();
+        let selected = entries.iter().find(|entry| entry["id"] == "saved").unwrap();
+        assert_eq!(selected["plan_type"], "team");
+        assert_eq!(selected["entitlement"], json!({"enabled":true}));
+        assert_eq!(selected["workspace_backend_origin"], "NO_CONSTRAINT");
+        assert_eq!(selected["account_routing_override"], "NO_CONSTRAINT");
+        assert_eq!(value["account_ordering"], json!(["saved", "personal"]));
+        assert_eq!(value["default_account_id"], "saved");
+        let mut no_header = original;
+        accounts(&mut no_header, None, Some("upstream")).unwrap();
+        assert_eq!(no_header["accounts"][0]["id"], "upstream");
+    }
+
+    async fn ledger() -> Ledger {
+        Ledger::from_pool(
+            SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .unwrap(),
+            [(Arc::from("Alice"), WeeklyCredits::Limited(Decimal::ONE))]
+                .into_iter()
+                .collect(),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn status(reset: i64) -> Value {
+        json!({"account_id":"upstream", "user_id":"upstream-user", "plan_type":"team",
+            "rate_limit":{"allowed":false,"limit_reached":true,"primary_window":{"used_percent":99},
+                "secondary_window":{"used_percent":90,"limit_window_seconds":604800,"reset_at":reset,"reset_after_seconds":601200}},
+            "credits":{"balance":"900","has_credits":true,"unlimited":false},
+            "spend_control":{"reached":true,"individual_limit":{
+                "source":"workspace", "limit":"100", "used":"90", "remaining":"10",
+                "used_percent":90,"remaining_percent":10,"reset_at":reset,"reset_after_seconds":2505600}},
+            "additional_rate_limits":[{"limit_name":"Extra", "metered_feature":"extra", "normal_model_slug":"gpt-extra",
+                "rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":80}}}],
+            "rate_limit_reset_credits":{"available_count":1}, "rate_limit_upsell":{"action":"preserved"},
+            "rate_limit_reached_type":{"type":"workspace_member_usage_limit_reached"},"unknown":"preserved"})
+    }
+
+    #[tokio::test]
+    async fn status_uses_only_user_consumption_and_preserves_upstream_policy_and_reset() {
+        let ledger = ledger().await;
+        let now = chrono::Utc::now().timestamp();
+        let start = now - 3600;
+        let end = start + 7 * 86400;
+        for (user, amount) in [("Alice", "0.1"), ("Alice", "0.2"), ("Bob", "999")] {
+            ledger
+                .record(
+                    user,
+                    Some(json!({"usage_metadata":{"amount":amount}})),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let original = status(end);
+        let mut value = original.clone();
+        usage(&ledger, "Alice", &mut value, Decimal::ONE, now)
+            .await
+            .unwrap();
+        let mut expected = original.clone();
+        expected["credits"] = Value::Null;
+        expected["rate_limit"]["primary_window"] = Value::Null;
+        expected["rate_limit"]["secondary_window"]["used_percent"] = json!(30);
+        expected["additional_rate_limits"][0]["rate_limit"]["primary_window"] = Value::Null;
+        expected["spend_control"]["individual_limit"] = Value::Null;
+        assert_eq!(value, expected);
+        let recorded: String = sqlx::query_scalar(
+            "SELECT credits FROM observations WHERE user='Alice' ORDER BY rowid DESC LIMIT 1",
+        )
+        .fetch_one(&ledger.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&recorded).unwrap()["spend_control"],
+            original["spend_control"]
+        );
+
+        ledger
+            .record("Alice", Some(json!({"total_tokens":100})), None)
+            .await
+            .unwrap();
+        let mut missing_amount = original;
+        usage(&ledger, "Alice", &mut missing_amount, Decimal::ONE, now)
+            .await
+            .unwrap();
+        assert!(missing_amount["rate_limit"]["secondary_window"].is_null());
+        assert_eq!(missing_amount["spend_control"]["reached"], true);
+        let mut absent_limit = json!({"plan_type":"plus", "unknown":true});
+        let original = absent_limit.clone();
+        usage(&ledger, "Alice", &mut absent_limit, Decimal::ONE, now)
+            .await
+            .unwrap();
+        assert_eq!(absent_limit, original);
+    }
+
+    #[tokio::test]
+    async fn adapters_preserve_errors_and_trailers_and_surface_database_failure() {
+        let ledger = ledger().await;
+        let error = Response::builder()
+            .status(429)
+            .header("etag", "original")
+            .body(Body::from("upstream error"))
+            .unwrap();
+        let error = rewrite(
+            &ledger,
+            "Alice",
+            error,
+            Rewrite::Usage,
+            None,
+            None,
+            &Mutex::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(error.status(), 429);
+        assert_eq!(error.headers()["etag"], "original");
+        assert_eq!(
+            error.into_body().collect().await.unwrap().to_bytes(),
+            "upstream error"
+        );
+        let mut trailers = HeaderMap::new();
+        trailers.insert("digest", "stale".parse().unwrap());
+        trailers.insert("x-trailer", "keep".parse().unwrap());
+        let response = Response::builder()
+            .header("etag", "stale")
+            .header("x-extra", "keep")
+            .body(Body::new(StreamBody::new(futures_util::stream::iter([
+                Ok::<_, std::io::Error>(Frame::data(Bytes::from_static(
+                    br#"{"plan_type":"plus","credits":{"balance":"9"}}"#,
+                ))),
+                Ok(Frame::trailers(trailers)),
+            ]))))
+            .unwrap();
+        let response = rewrite(
+            &ledger,
+            "Alice",
+            response,
+            Rewrite::Usage,
+            None,
+            None,
+            &Mutex::default(),
+        )
+        .await
+        .unwrap();
+        assert!(!response.headers().contains_key("etag"));
+        assert_eq!(response.headers()["x-extra"], "keep");
+        let body = response.into_body().collect().await.unwrap();
+        assert_eq!(body.trailers().unwrap()["x-trailer"], "keep");
+        assert!(!body.trailers().unwrap().contains_key("digest"));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body.to_bytes()).unwrap(),
+            json!({"plan_type":"plus","credits":null})
+        );
+        sqlx::query("DROP TABLE observations")
+            .execute(&ledger.pool)
+            .await
+            .unwrap();
+        assert!(
+            rewrite(
+                &ledger,
+                "Alice",
+                Response::new(Body::from(status(2000000000).to_string())),
+                Rewrite::Usage,
+                None,
+                None,
+                &Mutex::default()
+            )
+            .await
+            .is_err()
+        );
+    }
+}

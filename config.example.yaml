@@ -1,0 +1,39 @@
+server:
+  listen: "127.0.0.1:8787"
+
+# Relative file paths are resolved against this configuration file's directory.
+database: unicodex.sqlite3
+
+inbounds:
+  - id: alice-route
+    user: Alice
+    type: codex
+    # Client http_headers: Authorization = "Bearer <key>" (see README for the Codex patch).
+    key: "choose-a-local-secret"
+    # Required: a nonnegative decimal allowance for the upstream weekly window.
+    weekly_credits: "100"
+  - id: bob-route
+    user: Bob
+    type: codex
+    key: "choose-another-local-secret"
+    # No local quota; preserve upstream status and record usage best-effort.
+    weekly_credits: "unlimited"
+
+outbounds:
+  - id: account-1
+    type: codex
+    # Strict restricts limited users to documented routes. Unlimited users always use broad.
+    mode: broad
+    base_url: https://chatgpt.com/backend-api/codex
+    chatgpt_base_url: https://chatgpt.com/backend-api
+    api_base_url: https://api.openai.com/v1
+    auth_base_url: https://auth.openai.com
+    # Proxy-owned copy containing access_token, refresh_token, id_token and account_id.
+    auth_file: /path/to/account-1/auth.json
+    # Alternatively, replace auth_file with token_env: UNICODEX_UPSTREAM_TOKEN
+    # and optionally account_id: your-account-id.
+
+routing:
+  rules:
+    - inbound_ids: [alice-route, bob-route]
+      outbound_id: account-1
