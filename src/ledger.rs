@@ -1,13 +1,61 @@
 use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
-use anyhow::Context;
-use rust_decimal::Decimal;
-use sqlx::{
-    SqlitePool,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+use anyhow::{Context, ensure};
+use rust_decimal::{Decimal, prelude::ToPrimitive};
+use toasty::{
+    Db,
+    migration::{MigrationFile, MigrationSet},
+    stmt::{Type, Value},
 };
+use toasty_driver_turso::Turso;
 
 use crate::proxy::{Admission, ProxyError};
+
+const CREDIT_SCALE: i64 = 1_000_000_000;
+const MIGRATIONS: MigrationSet = MigrationSet::new(&[MigrationFile::new(
+    1,
+    "0000_credit_entries.sql",
+    include_str!("../migrations/0000_credit_entries.sql"),
+)]);
+
+/// Exact nonnegative credits in billionths. Construction validates precision and range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CreditAmount(i64);
+
+impl CreditAmount {
+    pub fn from_decimal(value: Decimal) -> anyhow::Result<Self> {
+        ensure!(!value.is_sign_negative(), "negative credit amount");
+        let scaled = value
+            .checked_mul(Decimal::from(CREDIT_SCALE))
+            .context("credit amount overflow")?;
+        ensure!(
+            scaled.fract().is_zero(),
+            "credit amount exceeds storage precision"
+        );
+        let units = scaled.to_i64().context("credit amount overflow")?;
+        ensure!(
+            Decimal::from(units) / Decimal::from(CREDIT_SCALE) == value,
+            "credit amount loses precision"
+        );
+        Ok(Self(units))
+    }
+
+    pub fn decimal(self) -> Decimal {
+        Decimal::new(self.0, 9)
+    }
+}
+
+#[derive(Debug, toasty::Model)]
+#[table = "credit_entries"]
+#[index(name = "credit_entries_user_timestamp", user, timestamp)]
+pub(crate) struct CreditEntry {
+    #[key]
+    #[auto]
+    pub id: i64,
+    pub timestamp: i64,
+    pub user: String,
+    pub credits: i64,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WeeklyCredits {
@@ -27,10 +75,9 @@ impl WeeklyWindow {
     }
 }
 
-/// Shared database pool; observations contain only identity, time and reported accounting fields.
 #[derive(Clone)]
 pub struct Ledger {
-    pub(crate) pool: SqlitePool,
+    db: Db,
     weekly_credits: Arc<HashMap<Arc<str>, WeeklyCredits>>,
 }
 
@@ -39,133 +86,142 @@ impl Ledger {
         self.weekly_credits
             .get(user)
             .copied()
-            .context("missing user credit policy")
-    }
-
-    /// Sum the user's reported consumption in [start, end), excluding future reports.
-    pub(crate) async fn consumed_credits(
-        &self,
-        user: &str,
-        start: i64,
-        end: i64,
-        now: i64,
-    ) -> anyhow::Result<Option<rust_decimal::Decimal>> {
-        let reports: Vec<String> = sqlx::query_scalar(
-            "SELECT usage FROM observations WHERE user = ? AND usage IS NOT NULL
-             AND unixepoch(timestamp) >= ? AND unixepoch(timestamp) < ?
-             AND unixepoch(timestamp) <= ?",
-        )
-        .bind(user)
-        .bind(start)
-        .bind(end)
-        .bind(now)
-        .fetch_all(&self.pool)
-        .await
-        .inspect_err(|_| {
-            tracing::error!(operation = "read_consumption", "database operation failed")
-        })?;
-        let mut total = rust_decimal::Decimal::ZERO;
-        for report in reports {
-            let report: serde_json::Value = serde_json::from_str(&report)?;
-            let Some(amount) = report.pointer("/usage_metadata/amount").and_then(decimal) else {
-                return Ok(None);
-            };
-            let Some(next) = total.checked_add(amount) else {
-                return Ok(None);
-            };
-            if next.checked_sub(total) != Some(amount) || next.checked_sub(amount) != Some(total) {
-                return Ok(None);
-            }
-            total = next;
-        }
-        Ok(Some(total))
+            .ok_or_else(|| ledger_error("missing_user_credit_policy"))
     }
 
     pub async fn open(
         path: &Path,
         weekly_credits: HashMap<Arc<str>, WeeklyCredits>,
     ) -> anyhow::Result<Self> {
-        let options = SqliteConnectOptions::new()
-            .filename(path)
-            .create_if_missing(true)
-            .busy_timeout(Duration::from_secs(5));
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect_with(options)
-            .await
-            .inspect_err(|_| {
-                tracing::error!(operation = "open_database", "database operation failed")
-            })?;
-        Self::from_pool(pool, weekly_credits).await
+        Self::from_driver(Turso::file(path), weekly_credits).await
     }
 
-    pub async fn from_pool(
-        pool: SqlitePool,
+    async fn from_driver(
+        driver: Turso,
         weekly_credits: HashMap<Arc<str>, WeeklyCredits>,
     ) -> anyhow::Result<Self> {
-        sqlx::raw_sql(
-            "CREATE TABLE IF NOT EXISTS observations (
-                timestamp TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-                user TEXT NOT NULL,
-                usage TEXT,
-                credits TEXT,
-                CHECK (usage IS NOT NULL OR credits IS NOT NULL)
-            );
-            CREATE INDEX IF NOT EXISTS observations_user_time ON observations(user, timestamp);",
+        let mut db = Db::builder()
+            .models(toasty::models!(CreditEntry))
+            // Serialize short DB operations, never network requests or inference.
+            .max_pool_size(1)
+            .pool_wait_timeout(Some(Duration::from_secs(5)))
+            .log_statement_params(false)
+            .build(driver)
+            .await?;
+        let tables = toasty::sql::query(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
         )
-        .execute(&pool)
-        .await
-        .inspect_err(|_| {
-            tracing::error!(operation = "initialize_schema", "database operation failed")
-        })?;
+        .exec(&mut db)
+        .await?;
+        let compatible = tables.iter().any(|row| matches!(row, Value::Record(fields) if fields[0] == Value::String("__toasty_migrations".into())));
+        if !tables.is_empty() && !compatible {
+            tracing::error!(
+                operation = "open_ledger",
+                reason = "incompatible_database",
+                "configure a fresh database path, for example unicodex.turso.db; existing data was not changed"
+            );
+        }
+        ensure!(
+            tables.is_empty() || compatible,
+            "incompatible database; configure a fresh database path (for example unicodex.turso.db)"
+        );
+        MIGRATIONS.apply(&db).await?;
+        // Validate the schema on restart without resetting or dropping existing data.
+        toasty::sql::query("SELECT id, timestamp, user, credits FROM credit_entries LIMIT 0")
+            .exec(&mut db)
+            .await?;
         Ok(Self {
-            pool,
+            db,
             weekly_credits: Arc::new(weekly_credits),
         })
     }
 
-    pub(crate) async fn record(
+    /// Sum the user's stored charges in [start, end), excluding future timestamps.
+    /// Bounds and now use Unix seconds; stored timestamps retain milliseconds.
+    pub(crate) async fn consumed_credits(
         &self,
         user: &str,
-        usage: Option<serde_json::Value>,
-        credits: Option<serde_json::Value>,
-    ) -> anyhow::Result<()> {
-        if usage.is_none() && credits.is_none() {
-            return Ok(());
+        start: i64,
+        end: i64,
+        now: i64,
+    ) -> anyhow::Result<Decimal> {
+        let start = start
+            .checked_mul(1000)
+            .ok_or_else(|| ledger_error("window_start_overflow"))?;
+        let end = end
+            .checked_mul(1000)
+            .ok_or_else(|| ledger_error("window_end_overflow"))?;
+        let until = now
+            .checked_add(1)
+            .and_then(|v| v.checked_mul(1000))
+            .ok_or_else(|| ledger_error("window_time_overflow"))?;
+        let rows = toasty::sql::query("SELECT COALESCE(SUM(credits), 0) FROM credit_entries WHERE user = ?1 AND timestamp >= ?2 AND timestamp < ?3 AND timestamp < ?4")
+            .bind(user).bind(start).bind(end).bind(until)
+            .column_types([Type::I64]).exec(&mut self.db.clone()).await
+            .inspect_err(|_| tracing::error!(operation = "read_consumption", reason = "query_failed", "database operation failed"))?;
+        let Some(Value::Record(fields)) = rows.first() else {
+            return Err(ledger_error("invalid_credit_total_row"));
+        };
+        let Some(Value::I64(units)) = fields.first() else {
+            return Err(ledger_error("noninteger_credit_total"));
+        };
+        if *units < 0 {
+            return Err(ledger_error("negative_credit_total"));
         }
-        sqlx::query("INSERT INTO observations(user, usage, credits) VALUES (?, ?, ?)")
-            .bind(user)
-            .bind(usage.map(|value| value.to_string()))
-            .bind(credits.map(|value| value.to_string()))
-            .execute(&self.pool)
+        Ok(CreditAmount(*units).decimal())
+    }
+
+    pub(crate) async fn record_charge(
+        &self,
+        user: &str,
+        credits: CreditAmount,
+    ) -> anyhow::Result<()> {
+        self.record_at(user, credits, chrono::Utc::now().timestamp_millis())
+            .await
+    }
+
+    async fn record_at(
+        &self,
+        user: &str,
+        credits: CreditAmount,
+        timestamp: i64,
+    ) -> anyhow::Result<()> {
+        CreditEntry::create()
+            .timestamp(timestamp)
+            .user(user)
+            .credits(credits.0)
+            .exec(&mut self.db.clone())
             .await
             .inspect_err(|_| {
-                tracing::error!(
-                    operation = "record_observation",
-                    "database operation failed"
-                )
+                tracing::error!(operation = "record_charge", "database operation failed")
             })?;
         Ok(())
     }
+
+    #[cfg(test)]
+    pub(crate) async fn in_memory(
+        weekly_credits: HashMap<Arc<str>, WeeklyCredits>,
+    ) -> anyhow::Result<Self> {
+        Self::from_driver(Turso::in_memory(), weekly_credits).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn entries(&self) -> Vec<CreditEntry> {
+        CreditEntry::all().exec(&mut self.db.clone()).await.unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn execute(&self, sql: &str) {
+        toasty::sql::statement(sql)
+            .exec(&mut self.db.clone())
+            .await
+            .unwrap();
+    }
 }
 
-/// Decimal strings stay decimal; malformed, negative, or unrepresentable amounts are unknown.
-pub(crate) fn decimal(value: &serde_json::Value) -> Option<rust_decimal::Decimal> {
-    let text = match value {
-        serde_json::Value::String(value) => value.clone(),
-        serde_json::Value::Number(value) => value.to_string(),
-        _ => return None,
-    };
-    rust_decimal::Decimal::from_str_exact(&text)
-        .or_else(|error| {
-            let Some((mantissa, _)) = text.split_once(['e', 'E']) else {
-                return Err(error);
-            };
-            rust_decimal::Decimal::from_str_exact(mantissa)?;
-            rust_decimal::Decimal::from_scientific(&text)
-        })
-        .ok()
-        .filter(|value| !value.is_sign_negative())
+fn ledger_error(reason: &'static str) -> anyhow::Error {
+    tracing::error!(operation = "check_credits", reason, "ledger check failed");
+    anyhow::anyhow!(reason)
 }
 
 impl Admission for Ledger {
@@ -179,11 +235,10 @@ impl Admission for Ledger {
         let now = chrono::Utc::now().timestamp();
         let window = window
             .filter(|window| window.contains(now))
-            .context("current weekly window unavailable")?;
+            .ok_or_else(|| ledger_error("current_weekly_window_unavailable"))?;
         let used = self
             .consumed_credits(user, window.start, window.end, now)
-            .await?
-            .context("weekly consumption unknown")?;
+            .await?;
         if used < allowance {
             Ok(())
         } else {
@@ -196,78 +251,140 @@ impl Admission for Ledger {
 mod tests {
     use super::*;
 
+    fn amount(value: &str) -> CreditAmount {
+        CreditAmount::from_decimal(Decimal::from_str_exact(value).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn amounts_preserve_precision_and_reject_overflow() {
+        for value in [
+            "0",
+            "0.000000001",
+            "0.00000025",
+            "0.1",
+            "9223372036.854775807",
+        ] {
+            assert_eq!(
+                amount(value).decimal(),
+                Decimal::from_str_exact(value).unwrap()
+            );
+        }
+        for value in ["-1", "0.0000000001", "9223372036.854775808"] {
+            assert!(CreditAmount::from_decimal(Decimal::from_str_exact(value).unwrap()).is_err());
+        }
+    }
+
     #[tokio::test]
-    async fn consumption_sums_exact_reports_for_the_user_in_the_current_period() {
-        use rust_decimal::Decimal;
-        use serde_json::json;
-        let ledger = Ledger::from_pool(
-            SqlitePoolOptions::new()
-                .max_connections(1)
-                .connect("sqlite::memory:")
-                .await
-                .unwrap(),
-            Default::default(),
-        )
-        .await
-        .unwrap();
-        let start = 1_800_000_000i64;
-        let end = start + 7 * 86400;
-        for (time, user, amount) in [
+    async fn sums_exact_numeric_charges_with_user_and_window_isolation() {
+        let ledger = Ledger::in_memory(Default::default()).await.unwrap();
+        let start = 1_800_000_000;
+        let end = start + 604800;
+        for (timestamp, user, value) in [
             (start - 1, "Alice", "999"),
             (start, "Alice", "0.1"),
             (start + 1, "Alice", "0.2"),
             (start + 1, "Bob", "999"),
             (end, "Alice", "999"),
+            (start + 3, "Alice", "7"),
         ] {
-            sqlx::query("INSERT INTO observations(timestamp,user,usage) VALUES (strftime('%Y-%m-%dT%H:%M:%SZ', ?, 'unixepoch'),?,?)")
-                .bind(time).bind(user).bind(json!({"usage_metadata":{"amount":amount}}).to_string())
-                .execute(&ledger.pool).await.unwrap();
+            ledger
+                .record_at(user, amount(value), timestamp * 1000)
+                .await
+                .unwrap();
         }
         assert_eq!(
             ledger
                 .consumed_credits("Alice", start, end, start + 2)
                 .await
                 .unwrap(),
-            Some(Decimal::new(3, 1))
+            Decimal::new(3, 1)
         );
         assert_eq!(
             ledger
                 .consumed_credits("Bob", start, end, start + 2)
                 .await
                 .unwrap(),
-            Some(Decimal::from(999))
+            Decimal::from(999)
         );
         assert_eq!(
             ledger
-                .consumed_credits("Alice", start, end, end)
+                .consumed_credits("Nobody", start, end, start + 2)
                 .await
                 .unwrap(),
-            Some(Decimal::new(3, 1))
+            Decimal::ZERO
         );
-        for invalid in [
-            json!("bad"),
-            json!("-1"),
-            json!("0.00000000000000000000000000001"),
-            json!("1.00000000000000000000000000001e0"),
-            serde_json::Value::Null,
-        ] {
-            assert!(decimal(&invalid).is_none(), "{invalid}");
-        }
-        assert_eq!(decimal(&json!("1.25e-2")), Some(Decimal::new(125, 4)));
     }
 
     #[tokio::test]
-    async fn weekly_credits_are_local_and_fail_closed() {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
+    async fn restart_preserves_charges_and_migrations_are_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("ledger.db");
+        let ledger = Ledger::open(&path, Default::default()).await.unwrap();
+        let now = chrono::Utc::now().timestamp();
+        assert_eq!(
+            ledger
+                .consumed_credits("Alice", now - 3600, now + 3600, now)
+                .await
+                .unwrap(),
+            Decimal::ZERO
+        );
+        ledger
+            .record_charge("Alice", amount("0.125"))
             .await
             .unwrap();
-        let ledger = Ledger::from_pool(
-            pool,
+        drop(ledger);
+        let ledger = Ledger::open(&path, Default::default()).await.unwrap();
+        assert_eq!(ledger.entries().await[0].credits, 125_000_000);
+        assert_eq!(
+            ledger
+                .consumed_credits("Alice", now - 3600, now + 3600, now)
+                .await
+                .unwrap(),
+            Decimal::new(125, 3)
+        );
+        assert_eq!(MIGRATIONS.apply(&ledger.db).await.unwrap().skipped(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_charges_do_not_collide_or_lose_updates() {
+        let ledger = Ledger::in_memory(Default::default()).await.unwrap();
+        let charges = (0..20).map(|_| ledger.record_at("Alice", amount("0.1"), 1_800_000_000_000));
+        for result in futures_util::future::join_all(charges).await {
+            result.unwrap();
+        }
+        let entries = ledger.entries().await;
+        assert_eq!(entries.len(), 20);
+        let ids: std::collections::HashSet<_> = entries.iter().map(|v| v.id).collect();
+        assert_eq!(ids.len(), 20);
+        assert_eq!(
+            ledger
+                .consumed_credits("Alice", 1_800_000_000, 1_800_000_001, 1_800_000_000)
+                .await
+                .unwrap(),
+            Decimal::from(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn summed_credits_reject_integer_overflow() {
+        let ledger = Ledger::in_memory(Default::default()).await.unwrap();
+        ledger
+            .record_at("Alice", CreditAmount(i64::MAX), 1000)
+            .await
+            .unwrap();
+        ledger
+            .record_at("Alice", CreditAmount(1), 1000)
+            .await
+            .unwrap();
+        assert!(ledger.consumed_credits("Alice", 0, 2, 1).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn quota_exhaustion_and_database_errors_remain_distinct() {
+        let ledger = Ledger::in_memory(
             [
                 (Arc::from("Alice"), WeeklyCredits::Limited(Decimal::ONE)),
-                (Arc::from("Bob"), WeeklyCredits::Limited(Decimal::ZERO)),
+                (Arc::from("Bob"), WeeklyCredits::Unlimited),
             ]
             .into_iter()
             .collect(),
@@ -284,42 +401,36 @@ mod tests {
             Err(ProxyError::Internal(_))
         ));
         assert!(ledger.check("Alice", window).await.is_ok());
-        assert!(matches!(
-            ledger.check("Bob", window).await,
-            Err(ProxyError::NoCredits)
-        ));
-        // Upstream account snapshots are evidence, not local user allowances.
-        ledger
-            .record(
-                "Bob",
-                None,
-                Some(serde_json::json!({"balance":"999","unlimited":true})),
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            ledger.check("Bob", window).await,
-            Err(ProxyError::NoCredits)
-        ));
-        ledger
-            .record(
-                "Alice",
-                Some(serde_json::json!({"usage_metadata":{"amount":"1"}})),
-                None,
-            )
-            .await
-            .unwrap();
+        ledger.record_charge("Alice", amount("1")).await.unwrap();
         assert!(matches!(
             ledger.check("Alice", window).await,
             Err(ProxyError::NoCredits)
         ));
-        sqlx::query("DROP TABLE observations")
-            .execute(&ledger.pool)
-            .await
-            .unwrap();
+        ledger.execute("DROP TABLE credit_entries").await;
         assert!(matches!(
             ledger.check("Alice", window).await,
             Err(ProxyError::Internal(_))
         ));
+        assert!(ledger.check("Bob", None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn legacy_database_is_rejected_without_deleting_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("old.db");
+        let mut db = Db::builder().build(Turso::file(&path)).await.unwrap();
+        toasty::sql::statement("CREATE TABLE observations (usage TEXT)")
+            .exec(&mut db)
+            .await
+            .unwrap();
+        drop(db);
+        assert!(Ledger::open(&path, Default::default()).await.is_err());
+        let mut db = Db::builder().build(Turso::file(&path)).await.unwrap();
+        assert!(
+            toasty::sql::query("SELECT usage FROM observations")
+                .exec(&mut db)
+                .await
+                .is_ok()
+        );
     }
 }

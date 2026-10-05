@@ -25,7 +25,7 @@ use super::{
     account::{self, CachedWindow},
     auth::{CredentialManager, Credentials},
     routes::{self, Family, Mode, Rewrite},
-    stat::CodexObserver,
+    stat::{CodexObserver, RequestCapture, ResponseTracker},
     transport::{self, HttpClient},
 };
 use crate::ledger::{Ledger, WeeklyCredits};
@@ -228,6 +228,11 @@ impl CodexOutbound {
         let started = std::time::Instant::now();
         match transport {
             Transport::Http => {
+                let capture = if route.inference {
+                    RequestCapture::inspect(&mut req)
+                } else {
+                    RequestCapture::default()
+                };
                 *req.uri_mut() = target
                     .parse()
                     .map_err(|error| ProxyError::BadRequest(anyhow::Error::new(error)))?;
@@ -279,7 +284,7 @@ impl CodexOutbound {
                     .map_err(ProxyError::Internal)
                 } else if route.inference || route.rewrite == Some(Rewrite::Usage) {
                     observer
-                        .observe_http(user, response)
+                        .observe_http_with_context(user, response, capture)
                         .await
                         .map_err(ProxyError::Internal)
                 } else {
@@ -508,6 +513,7 @@ async fn relay(
 ) -> Result<(), ProxyError> {
     let observer = &outbound.observer;
     let unlimited = admission.weekly_credits(user)? == WeeklyCredits::Unlimited;
+    let mut tracker = ResponseTracker::default();
     loop {
         tokio::select! {
             // Finish persisting an available upstream report before accepting the next client request.
@@ -517,11 +523,11 @@ async fn relay(
                 let message = message.map_err(|error| ProxyError::Upstream(error.into()))?;
                 let message = match message {
                     tungstenite::Message::Text(text) => {
-                        if inference { observer.observe_ws(user, text.as_bytes()).await?; }
+                        if inference { observer.message(user, text.as_bytes(), &mut tracker).await; }
                         Message::Text(text.as_str().to_owned().into())
                     }
                     tungstenite::Message::Binary(bytes) => {
-                        if inference { observer.observe_ws(user, &bytes).await?; }
+                        if inference { observer.message(user, &bytes, &mut tracker).await; }
                         Message::Binary(bytes)
                     }
                     tungstenite::Message::Close(frame) => {
@@ -559,6 +565,11 @@ async fn relay(
                             Err(error) => return Err(error),
                         }
                 }
+                if inference && let Some(data) = data
+                    && let Ok(value) = serde_json::from_slice::<serde_json::Value>(data)
+                    && value.get("type").and_then(serde_json::Value::as_str) == Some("response.create") {
+                        tracker.request(&value);
+                }
                 let message = match message {
                     Message::Text(text) => tungstenite::Message::Text(text.as_str().to_owned().into()),
                     Message::Binary(bytes) => tungstenite::Message::Binary(bytes),
@@ -592,7 +603,6 @@ mod tests {
         extract::{Request, ws::WebSocketUpgrade},
         http::StatusCode,
     };
-    use sqlx::sqlite::SqlitePoolOptions;
     use std::{
         sync::atomic::{AtomicUsize, Ordering},
         time::Duration,
@@ -629,13 +639,7 @@ mod tests {
         options: OutboundOptions,
         credentials: CredentialManager,
     ) -> (App, Ledger) {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        let ledger = Ledger::from_pool(
-            pool,
+        let ledger = Ledger::in_memory(
             [(
                 Arc::from("Alice"),
                 WeeklyCredits::Limited(rust_decimal::Decimal::ONE),
@@ -649,7 +653,7 @@ mod tests {
             "upstream".into(),
             options,
             credentials,
-            Arc::new(CodexObserver::new(ledger.clone())),
+            Arc::new(CodexObserver::new(ledger.clone()).unwrap()),
         )
         .unwrap();
         let credentials = outbound.credentials.credentials().await.unwrap();
@@ -701,7 +705,7 @@ mod tests {
     async fn create(socket: &mut UpstreamSocket) {
         socket
             .send(tungstenite::Message::Text(
-                r#"{"type":"response.create","model":"test"}"#.into(),
+                r#"{"type":"response.create","model":"gpt-6.1-sol"}"#.into(),
             ))
             .await
             .unwrap();
@@ -715,6 +719,56 @@ mod tests {
                 async move { next.run(req).await }.with_subscriber(subscriber)
             },
         ))
+    }
+
+    #[tokio::test]
+    async fn limited_admission_discovers_bounds_and_status_shows_the_numeric_usage_bar() {
+        let end = chrono::Utc::now().timestamp() + 601200;
+        let upstream = serve(Router::new()
+            .route("/product/wham/usage", axum::routing::get(move || async move {
+                axum::Json(serde_json::json!({"plan_type":"plus", "rate_limit":{
+                    "allowed":true,"limit_reached":false,
+                    "secondary_window":{"used_percent":95,"limit_window_seconds":604800,"reset_at":end,"reset_after_seconds":601200}
+                }}))
+            }))
+            .route("/model/responses", axum::routing::post(|| async {
+                axum::Json(serde_json::json!({"usage":{"input_tokens":0,"output_tokens":1000}}))
+            }))).await;
+        let (app, ledger) = app_with_options(
+            OutboundOptions {
+                base_url: format!("http://{}/model", upstream.address),
+                chatgpt_base_url: format!("http://{}/product", upstream.address),
+                ..format!("http://{}/model", upstream.address).into()
+            },
+            Credentials::bearer("upstream-secret", Some("upstream-account"))
+                .unwrap()
+                .into(),
+        )
+        .await;
+        let OutboundKind::Codex(outbound) = &app.outbounds[0];
+        *outbound.window.lock().await = CachedWindow::default();
+        for _ in 0..2 {
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/backend-api/codex/responses")
+                .header(header::AUTHORIZATION, "Bearer local-secret")
+                .body(Body::from(r#"{"model":"gpt-6.1-sol"}"#))
+                .unwrap();
+            let response = app.dispatch(req).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            response.into_body().collect().await.unwrap();
+        }
+        let req = axum::http::Request::builder()
+            .uri("/backend-api/wham/usage")
+            .header(header::AUTHORIZATION, "Bearer local-secret")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.dispatch(req).await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status["rate_limit"]["secondary_window"]["used_percent"], 50);
+        assert_eq!(status["rate_limit"]["secondary_window"]["reset_at"], end);
+        assert_eq!(ledger.entries().await.len(), 2);
     }
 
     #[tokio::test]
@@ -860,15 +914,18 @@ mod tests {
             Err(ProxyError::NoRoute)
         ));
         ledger
-            .record(
+            .record_charge(
                 "Alice",
-                Some(serde_json::json!({"total_tokens":7,"usage_metadata":{"amount":"1"}})),
-                None,
+                crate::ledger::CreditAmount::from_decimal(rust_decimal::Decimal::ONE).unwrap(),
             )
             .await
             .unwrap();
         ledger
-            .record("Bob", Some(serde_json::json!({"total_tokens":999})), None)
+            .record_charge(
+                "Bob",
+                crate::ledger::CreditAmount::from_decimal(rust_decimal::Decimal::from(999))
+                    .unwrap(),
+            )
             .await
             .unwrap();
         // Codex selects its saved workspace ID, but that ID cannot select a ledger user.
@@ -1058,7 +1115,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("x-custom", "response")
                     .body(Body::from(
-                        r#"{"usage":{"output_tokens":2},"usage_metadata":{"amount":"1"}}"#,
+                        r#"{"model":"gpt-6.1-sol","usage":{"input_tokens":0,"output_tokens":4000}}"#,
                     ))
                     .unwrap()
             }
@@ -1089,13 +1146,9 @@ mod tests {
                 .unwrap()
                 .to_bytes()
                 .as_ref(),
-            br#"{"usage":{"output_tokens":2},"usage_metadata":{"amount":"1"}}"#
+            br#"{"model":"gpt-6.1-sol","usage":{"input_tokens":0,"output_tokens":4000}}"#
         );
-        let user: String = sqlx::query_scalar("SELECT user FROM observations")
-            .fetch_one(&ledger.pool)
-            .await
-            .unwrap();
-        assert_eq!(user, "Alice");
+        assert_eq!(ledger.entries().await[0].user, "Alice");
         assert!(matches!(
             app.dispatch(request()).await,
             Err(ProxyError::NoCredits)
@@ -1132,7 +1185,7 @@ mod tests {
                             notify.notify_one();
                             release.acquire().await.unwrap().forget();
                         }
-                        if socket.send(Message::Text(r#"{"type":"response.completed","response":{"usage":{"input_tokens":3},"usage_metadata":{"amount":"0"}}}"#.into())).await.is_err() { break; }
+                        if socket.send(Message::Text(r#"{"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":0}}}"#.into())).await.is_err() { break; }
                     }
                 });
                 response.headers_mut().insert("x-codex-credits-balance", "7.5".parse().unwrap());
@@ -1147,20 +1200,18 @@ mod tests {
             .unwrap();
         assert_eq!(handshake.headers()["x-custom"], "handshake");
         assert_eq!(handshake.headers()[header::SEC_WEBSOCKET_PROTOCOL], "codex");
-        let snapshot: (String, String) = sqlx::query_as("SELECT user, credits FROM observations")
-            .fetch_one(&ledger.pool)
-            .await
-            .unwrap();
-        assert_eq!(snapshot, ("Alice".into(), r#"{"balance":"7.5"}"#.into()));
+        assert!(
+            ledger.entries().await.is_empty(),
+            "handshakes are not spending"
+        );
         create(&mut client).await;
         tokio::time::timeout(Duration::from_secs(3), started.notified())
             .await
             .unwrap();
         ledger
-            .record(
+            .record_charge(
                 "Alice",
-                Some(serde_json::json!({"usage_metadata":{"amount":"1"}})),
-                None,
+                crate::ledger::CreditAmount::from_decimal(rust_decimal::Decimal::ONE).unwrap(),
             )
             .await
             .unwrap();
@@ -1174,15 +1225,16 @@ mod tests {
         finish.add_permits(1);
         let completed = next(&mut client).await;
         assert!(completed.to_text().unwrap().contains("response.completed"));
-        let user: String = sqlx::query_scalar(
-            "SELECT user FROM observations WHERE json_extract(usage, '$.input_tokens') = 3",
-        )
-        .fetch_one(&ledger.pool)
-        .await
-        .unwrap();
+        let entries = ledger.entries().await;
         assert_eq!(
-            user, "Alice",
-            "report must be committed before the client sees completion"
+            entries.len(),
+            2,
+            "charge must be stored before completion delivery"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.user == "Alice" && entry.credits == 150_000)
         );
         // Initial admission also prevents opening any upstream WebSocket.
         let denied = tokio_tungstenite::connect_async(ws_request(&proxy))
@@ -1192,15 +1244,14 @@ mod tests {
             matches!(denied, tungstenite::Error::Http(response) if response.status() == StatusCode::TOO_MANY_REQUESTS)
         );
         assert_eq!(handshakes.load(Ordering::SeqCst), 1);
-        sqlx::query(
-            "DELETE FROM observations WHERE json_extract(usage, '$.usage_metadata.amount') = '1'",
-        )
-        .execute(&ledger.pool)
-        .await
-        .unwrap();
+        ledger
+            .execute("DELETE FROM credit_entries WHERE credits = 1000000000")
+            .await;
         client
             .send(tungstenite::Message::Binary(
-                axum::body::Bytes::from_static(br#"{"type":"response.create"}"#),
+                axum::body::Bytes::from_static(
+                    br#"{"type":"response.create","model":"gpt-6.1-sol"}"#,
+                ),
             ))
             .await
             .unwrap();
@@ -1212,26 +1263,21 @@ mod tests {
                 .contains("response.completed")
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-        // Observer failure is an internal relay error, never an insufficient-credit decision.
-        sqlx::query("CREATE TRIGGER reject_observation BEFORE INSERT ON observations BEGIN SELECT RAISE(ABORT, 'database unavailable'); END")
-            .execute(&ledger.pool).await.unwrap();
+        // Accounting failure preserves completion and does not close the session.
+        ledger.execute("CREATE TRIGGER reject_charge BEFORE INSERT ON credit_entries BEGIN SELECT RAISE(ABORT, 'database unavailable'); END").await;
         create(&mut client).await;
         assert!(
-            matches!(next(&mut client).await, tungstenite::Message::Close(Some(frame)) if u16::from(frame.code) == 1011)
-        );
-        let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM observations WHERE usage IS NOT NULL")
-                .fetch_one(&ledger.pool)
+            next(&mut client)
                 .await
-                .unwrap();
-        assert_eq!(count, 2);
-        // Handshake observation failure is returned before the client upgrade succeeds.
-        let denied = tokio_tungstenite::connect_async(ws_request(&proxy))
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(denied, tungstenite::Error::Http(response) if response.status() == StatusCode::INTERNAL_SERVER_ERROR)
+                .to_text()
+                .unwrap()
+                .contains("response.completed")
         );
+        assert_eq!(ledger.entries().await.len(), 2);
+        let (mut another, _) = tokio_tungstenite::connect_async(ws_request(&proxy))
+            .await
+            .unwrap();
+        another.close(None).await.unwrap();
         let logs = capture.text();
         let started = logs
             .lines()
@@ -1239,16 +1285,15 @@ mod tests {
             .unwrap();
         let failed = logs
             .lines()
-            .find(|line| line.contains("WebSocket relay failed"))
+            .find(|line| line.contains("record_charge_failed"))
             .unwrap();
-        assert!(failed.contains("ERROR"));
-        assert!(failed.contains("error_kind=\"internal\""));
+        assert!(failed.contains("WARN"));
         assert_eq!(
             crate::logging::tests::request_id(started),
             crate::logging::tests::request_id(failed)
         );
         assert!(logs.contains("WebSocket request rejected"));
-        assert!(logs.contains("record_observation"));
+        assert!(logs.contains("record_charge"));
         for secret in [
             "local-secret",
             "upstream-secret",
@@ -1284,10 +1329,7 @@ mod tests {
         let (mut client, _) = tokio_tungstenite::connect_async(ws_request(&proxy))
             .await
             .unwrap();
-        sqlx::query("DROP TABLE observations")
-            .execute(&ledger.pool)
-            .await
-            .unwrap();
+        ledger.execute("DROP TABLE credit_entries").await;
         create(&mut client).await;
         assert!(
             matches!(next(&mut client).await, tungstenite::Message::Close(Some(frame)) if u16::from(frame.code) == 1011)
@@ -1296,7 +1338,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejected_websocket_handshake_preserves_status_and_observes_credits() {
+    async fn rejected_websocket_handshake_preserves_status_without_recording_a_charge() {
         let upstream = serve(Router::new().fallback(|| async {
             Response::builder()
                 .status(StatusCode::TOO_MANY_REQUESTS)
@@ -1321,10 +1363,141 @@ mod tests {
             }
             error => panic!("unexpected handshake failure: {error}"),
         }
-        let snapshot: (String, String) = sqlx::query_as("SELECT user, credits FROM observations")
-            .fetch_one(&ledger.pool)
+        assert!(ledger.entries().await.is_empty());
+    }
+    #[tokio::test]
+    async fn consecutive_limited_http_requests_without_response_metadata_are_charged() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let upstream = serve(Router::new().fallback(move |req: Request| {
+            let count = count.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                let compressed = req.headers().get("content-encoding").is_some_and(|v| v == "zstd");
+                let bytes = req.into_body().collect().await.unwrap().to_bytes();
+                let decoded = if compressed { zstd::decode_all(&bytes[..]).unwrap() } else { bytes.to_vec() };
+                let request: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+                assert!(request.get("model").is_some());
+                let bytes = b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"same-id-across-http-requests\",\"usage\":{\"input_tokens\":0,\"output_tokens\":1,\"input_tokens_details\":null}}}\n\n";
+                let chunks: Vec<_> = bytes.chunks(1).map(|v| Ok::<_, std::io::Error>(axum::body::Bytes::copy_from_slice(v))).collect();
+                Response::builder().header("content-type", "text/event-stream").body(Body::from_stream(futures_util::stream::iter(chunks))).unwrap()
+            }
+        })).await;
+        let (app, ledger) = app(&upstream).await;
+        for (model, compressed) in [
+            ("gpt-6.1-sol", false),
+            ("gpt-6.1-sol", true),
+            ("unknown", false),
+            ("gpt-6.1-sol", false),
+        ] {
+            let bytes = serde_json::json!({"model":model,"stream":true,"input":[]})
+                .to_string()
+                .into_bytes();
+            let bytes = if compressed {
+                zstd::encode_all(&bytes[..], 1).unwrap()
+            } else {
+                bytes
+            };
+            let request = Request::builder()
+                .method("POST")
+                .uri("/responses")
+                .header("authorization", "Bearer local-secret")
+                .header(
+                    "content-encoding",
+                    if compressed { "zstd" } else { "identity" },
+                )
+                .body(Body::from(bytes))
+                .unwrap();
+            let response = app.dispatch(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(
+                std::str::from_utf8(&bytes)
+                    .unwrap()
+                    .contains("response.completed")
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        let entries = ledger.entries().await;
+        assert_eq!(
+            entries.len(),
+            3,
+            "unpriceable completions are skipped, never poison later requests"
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|v| v.user == "Alice" && v.credits == 250_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn consecutive_limited_websocket_requests_survive_warmups_and_missing_metadata() {
+        let upstream = serve(Router::new().fallback(|upgrade: WebSocketUpgrade| async move {
+            upgrade.protocols(["codex"]).on_upgrade(|mut socket| async move {
+                let mut ordinal = 0;
+                while let Some(Ok(Message::Text(bytes))) = socket.recv().await {
+                    let request: serde_json::Value = serde_json::from_str(&bytes).unwrap();
+                    ordinal += 1;
+                    let id = format!("response-{ordinal}");
+                    let created = serde_json::json!({"type":"response.created","response":{"id":id}});
+                    socket.send(Message::Text(created.to_string().into())).await.unwrap();
+                    let response = if request.get("generate") == Some(&serde_json::Value::Bool(false)) {
+                        serde_json::json!({"id":id,"output":[]})
+                    } else {
+                        serde_json::json!({"id":id,"usage":{"input_tokens":0,"output_tokens":1}})
+                    };
+                    let completed = serde_json::json!({"type":"response.completed","response":response});
+                    if socket.send(Message::Text(completed.to_string().into())).await.is_err() { break; }
+                }
+            })
+        })).await;
+        let (app, ledger) = app(&upstream).await;
+        let proxy = serve(app.router()).await;
+        let (mut client, _) = tokio_tungstenite::connect_async(ws_request(&proxy))
             .await
             .unwrap();
-        assert_eq!(snapshot, ("Alice".into(), r#"{"balance":"0"}"#.into()));
+        client
+            .send(tungstenite::Message::Text(
+                r#"{"type":"response.create","model":"gpt-6.1-sol","generate":false}"#.into(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            next(&mut client)
+                .await
+                .to_text()
+                .unwrap()
+                .contains("response.created")
+        );
+        assert!(
+            next(&mut client)
+                .await
+                .to_text()
+                .unwrap()
+                .contains("response.completed")
+        );
+        assert!(ledger.entries().await.is_empty());
+        for _ in 0..2 {
+            create(&mut client).await;
+            assert!(
+                next(&mut client)
+                    .await
+                    .to_text()
+                    .unwrap()
+                    .contains("response.created")
+            );
+            assert!(
+                next(&mut client)
+                    .await
+                    .to_text()
+                    .unwrap()
+                    .contains("response.completed")
+            );
+        }
+        let entries = ledger.entries().await;
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|v| v.credits == 250_000));
+        client.close(None).await.unwrap();
     }
 }

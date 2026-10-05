@@ -40,14 +40,13 @@ pub fn weekly_window(value: &Value) -> Option<(&'static str, WeeklyWindow)> {
             continue;
         };
         if window.get("limit_window_seconds").and_then(Value::as_i64) == Some(604800) {
-            let end = window.get("reset_at")?.as_i64()?;
-            return Some((
-                field,
-                WeeklyWindow {
-                    start: end.checked_sub(604800)?,
-                    end,
-                },
-            ));
+            let Some(end) = window.get("reset_at").and_then(Value::as_i64) else {
+                continue;
+            };
+            let Some(start) = end.checked_sub(604800) else {
+                continue;
+            };
+            return Some((field, WeeklyWindow { start, end }));
         }
     }
     None
@@ -85,21 +84,37 @@ pub async fn rewrite(
     match kind {
         Rewrite::Accounts => accounts(&mut value, client_account, upstream_account)?,
         Rewrite::Usage => {
-            window_cache.lock().await.update(
-                upstream_account,
-                weekly_window(&value).map(|(_, window)| window),
-            );
+            let now = chrono::Utc::now().timestamp();
+            let reported = weekly_window(&value).filter(|(_, window)| window.contains(now));
+            let bounds = {
+                let mut cache = window_cache.lock().await;
+                if let Some((_, window)) = reported {
+                    cache.update(upstream_account, Some(window));
+                    Some(window)
+                } else {
+                    cache.get(upstream_account, now)
+                }
+            };
+            // A sparse status read must not erase valid bounds already discovered for
+            // this account. Restore a local weekly bar using those same quota bounds.
+            if reported.is_none()
+                && let Some(window) = bounds
+                && let Some(limit) = value.get_mut("rate_limit").and_then(Value::as_object_mut)
+            {
+                limit.insert(
+                    "secondary_window".into(),
+                    json!({
+                        "used_percent": 0,
+                        "limit_window_seconds": 604800,
+                        "reset_at": window.end,
+                        "reset_after_seconds": window.end - now,
+                    }),
+                );
+            }
             let WeeklyCredits::Limited(allowance) = ledger.weekly_credits(user)? else {
                 anyhow::bail!("unlimited status must use passthrough observation");
             };
-            usage(
-                ledger,
-                user,
-                &mut value,
-                allowance,
-                chrono::Utc::now().timestamp(),
-            )
-            .await?
+            usage(ledger, user, &mut value, allowance, now).await?
         }
     }
     let bytes = if value != original {
@@ -239,34 +254,25 @@ async fn usage(
     now: i64,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(value.is_object(), "invalid usage response");
-    let mut reported = serde_json::Map::new();
-    if let Some(credits) = value.get("credits").and_then(Value::as_object) {
-        for field in ["has_credits", "unlimited", "balance"] {
-            if let Some(value) = credits.get(field) {
-                reported.insert(field.into(), value.clone());
-            }
-        }
-    }
-    if let Some(control) = value.get("spend_control") {
-        reported.insert("spend_control".into(), control.clone());
-    }
-    if !reported.is_empty() {
-        ledger
-            .record(user, None, Some(Value::Object(reported)))
-            .await?;
-    }
-
     // These are optional display fields in RateLimitStatusPayload. Preserve permission
     // flags and metadata; show only the local user's percentage in the weekly window.
     if value.get("credits").is_some() {
         value["credits"] = Value::Null;
     }
     let weekly = weekly_window(value)
+        .filter(|(_, window)| window.contains(now))
         .map(|(field, window)| (field, window, value["rate_limit"][field].clone()));
+    if weekly.is_none() {
+        tracing::warn!(
+            operation = "adapt_usage",
+            reason = "current_weekly_window_missing",
+            "local usage bar unavailable; upstream weekly quota bounds are required"
+        );
+    }
     if let Some(limit) = value.get_mut("rate_limit") {
         hide_windows(limit);
         if let Some((field, bounds, mut window)) = weekly
-            && let Some(used) = ledger
+            && let used = ledger
                 .consumed_credits(user, bounds.start, bounds.end, now)
                 .await?
             && let Some(percent) = used_percent(used, allowance)
@@ -332,7 +338,6 @@ pub fn invalidate_body_headers(headers: &mut HeaderMap) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::sqlite::SqlitePoolOptions;
 
     #[test]
     fn discovery_preserves_metadata_and_matches_saved_workspace_for_both_formats() {
@@ -373,18 +378,96 @@ mod tests {
     }
 
     async fn ledger() -> Ledger {
-        Ledger::from_pool(
-            SqlitePoolOptions::new()
-                .max_connections(1)
-                .connect("sqlite::memory:")
-                .await
-                .unwrap(),
+        Ledger::in_memory(
             [(Arc::from("Alice"), WeeklyCredits::Limited(Decimal::ONE))]
                 .into_iter()
                 .collect(),
         )
         .await
         .unwrap()
+    }
+
+    #[test]
+    fn malformed_secondary_window_does_not_hide_a_valid_weekly_primary() {
+        let payload = json!({"rate_limit":{
+            "secondary_window":{"limit_window_seconds":604800,"reset_at":null},
+            "primary_window":{"limit_window_seconds":604800,"reset_at":1800000000}
+        }});
+        let (field, window) = weekly_window(&payload).unwrap();
+        assert_eq!(field, "primary_window");
+        assert_eq!(window.end, 1800000000);
+    }
+
+    #[tokio::test]
+    async fn sparse_status_preserves_the_local_weekly_bar_only_for_valid_account_bounds() {
+        let ledger = ledger().await;
+        ledger
+            .record_charge(
+                "Alice",
+                crate::ledger::CreditAmount::from_decimal(Decimal::new(25, 2)).unwrap(),
+            )
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let window = WeeklyWindow {
+            start: now - 3600,
+            end: now + 601200,
+        };
+        let cache = Mutex::new(CachedWindow::default());
+        cache.lock().await.update(Some("upstream"), Some(window));
+        let sparse = json!({"plan_type":"plus", "rate_limit":{
+            "allowed":true,"limit_reached":false,
+            "primary_window":{"used_percent":95,"limit_window_seconds":18000}
+        }});
+        let response = rewrite(
+            &ledger,
+            "Alice",
+            Response::new(Body::from(sparse.to_string())),
+            Rewrite::Usage,
+            None,
+            Some("upstream"),
+            &cache,
+        )
+        .await
+        .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let local: Value = serde_json::from_slice(&body).unwrap();
+        let bar = &local["rate_limit"]["secondary_window"];
+        assert_eq!(bar["used_percent"], 25);
+        assert_eq!(bar["limit_window_seconds"], 604800);
+        assert_eq!(bar["reset_at"], window.end);
+        assert!(bar["reset_after_seconds"].as_i64().unwrap() > 0);
+        assert_eq!(local["rate_limit"]["allowed"], true);
+        assert!(local["rate_limit"]["primary_window"].is_null());
+        assert!(cache.lock().await.get(Some("upstream"), now).is_some());
+
+        for (account, bounds) in [
+            (Some("different-account"), window),
+            (
+                Some("upstream"),
+                WeeklyWindow {
+                    start: now - 604800,
+                    end: now - 1,
+                },
+            ),
+        ] {
+            cache.lock().await.update(account, Some(bounds));
+            let response = rewrite(
+                &ledger,
+                "Alice",
+                Response::new(Body::from(sparse.to_string())),
+                Rewrite::Usage,
+                None,
+                Some("upstream"),
+                &cache,
+            )
+            .await
+            .unwrap();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let local: Value = serde_json::from_slice(&body).unwrap();
+            assert!(local["rate_limit"]["secondary_window"].is_null());
+        }
+        assert_eq!(ledger.entries().await.len(), 1);
     }
 
     fn status(reset: i64) -> Value {
@@ -409,10 +492,12 @@ mod tests {
         let end = start + 7 * 86400;
         for (user, amount) in [("Alice", "0.1"), ("Alice", "0.2"), ("Bob", "999")] {
             ledger
-                .record(
+                .record_charge(
                     user,
-                    Some(json!({"usage_metadata":{"amount":amount}})),
-                    None,
+                    crate::ledger::CreditAmount::from_decimal(
+                        Decimal::from_str_exact(amount).unwrap(),
+                    )
+                    .unwrap(),
                 )
                 .await
                 .unwrap();
@@ -429,27 +514,11 @@ mod tests {
         expected["additional_rate_limits"][0]["rate_limit"]["primary_window"] = Value::Null;
         expected["spend_control"]["individual_limit"] = Value::Null;
         assert_eq!(value, expected);
-        let recorded: String = sqlx::query_scalar(
-            "SELECT credits FROM observations WHERE user='Alice' ORDER BY rowid DESC LIMIT 1",
-        )
-        .fetch_one(&ledger.pool)
-        .await
-        .unwrap();
         assert_eq!(
-            serde_json::from_str::<Value>(&recorded).unwrap()["spend_control"],
-            original["spend_control"]
+            ledger.entries().await.len(),
+            3,
+            "status snapshots must not create charges"
         );
-
-        ledger
-            .record("Alice", Some(json!({"total_tokens":100})), None)
-            .await
-            .unwrap();
-        let mut missing_amount = original;
-        usage(&ledger, "Alice", &mut missing_amount, Decimal::ONE, now)
-            .await
-            .unwrap();
-        assert!(missing_amount["rate_limit"]["secondary_window"].is_null());
-        assert_eq!(missing_amount["spend_control"]["reached"], true);
         let mut absent_limit = json!({"plan_type":"plus", "unknown":true});
         let original = absent_limit.clone();
         usage(&ledger, "Alice", &mut absent_limit, Decimal::ONE, now)
@@ -516,15 +585,14 @@ mod tests {
             serde_json::from_slice::<Value>(&body.to_bytes()).unwrap(),
             json!({"plan_type":"plus","credits":null})
         );
-        sqlx::query("DROP TABLE observations")
-            .execute(&ledger.pool)
-            .await
-            .unwrap();
+        ledger.execute("DROP TABLE credit_entries").await;
         assert!(
             rewrite(
                 &ledger,
                 "Alice",
-                Response::new(Body::from(status(2000000000).to_string())),
+                Response::new(Body::from(
+                    status(chrono::Utc::now().timestamp() + 601200).to_string()
+                )),
                 Rewrite::Usage,
                 None,
                 None,

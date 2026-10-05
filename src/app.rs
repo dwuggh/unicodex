@@ -91,7 +91,6 @@ mod tests {
         stat::CodexObserver,
     };
     use axum::body::Body;
-    use sqlx::sqlite::SqlitePoolOptions;
     use std::{
         sync::atomic::{AtomicUsize, Ordering},
         time::Duration,
@@ -114,13 +113,7 @@ mod tests {
     }
 
     async fn setup(barrier: Option<Arc<Barrier>>) -> Fixture {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        let ledger = Ledger::from_pool(
-            pool,
+        let ledger = Ledger::in_memory(
             ["Alice", "Bob"]
                 .into_iter()
                 .map(|user| {
@@ -148,7 +141,7 @@ mod tests {
                 if let Some(barrier) = barrier {
                     barrier.wait().await;
                 }
-                axum::Json(serde_json::json!({"usage":{"input_tokens":1}}))
+                axum::Json(serde_json::json!({"model":"gpt-6.1-sol","usage":{"input_tokens":1,"output_tokens":0}}))
             }
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -174,7 +167,7 @@ mod tests {
                         ..format!("http://{address}").into()
                     },
                     Credentials::bearer("upstream-key", None).unwrap().into(),
-                    Arc::new(CodexObserver::new(ledger.clone())),
+                    Arc::new(CodexObserver::new(ledger.clone()).unwrap()),
                 )
                 .unwrap(),
             )],
@@ -228,10 +221,13 @@ mod tests {
         .expect("requests must not serialize behind an application lock");
         assert_eq!(results.0.to_bytes(), results.1.to_bytes());
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-        let users: Vec<String> = sqlx::query_scalar("SELECT user FROM observations ORDER BY user")
-            .fetch_all(&ledger.pool)
+        let mut users: Vec<String> = ledger
+            .entries()
             .await
-            .unwrap();
+            .into_iter()
+            .map(|entry| entry.user)
+            .collect();
+        users.sort();
         assert_eq!(users, ["Alice", "Bob"]);
         let logs = capture.text();
         let summaries: Vec<_> = logs
@@ -272,10 +268,9 @@ mod tests {
             server: _server,
         } = setup(None).await;
         ledger
-            .record(
+            .record_charge(
                 "Alice",
-                Some(serde_json::json!({"usage_metadata":{"amount":"1"}})),
-                None,
+                crate::ledger::CreditAmount::from_decimal(rust_decimal::Decimal::ONE).unwrap(),
             )
             .await
             .unwrap();
@@ -291,10 +286,7 @@ mod tests {
                 .await,
             Err(ProxyError::NoRoute)
         ));
-        sqlx::query("DROP TABLE observations")
-            .execute(&ledger.pool)
-            .await
-            .unwrap();
+        ledger.execute("DROP TABLE credit_entries").await;
         assert!(matches!(
             app.dispatch(request("alice-key"))
                 .with_subscriber(capture.subscriber("warn,unicodex=debug"))

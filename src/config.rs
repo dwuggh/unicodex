@@ -34,7 +34,7 @@ pub struct Config {
 }
 
 fn default_database() -> PathBuf {
-    "unicodex.sqlite3".into()
+    "unicodex.turso.db".into()
 }
 fn default_upstream() -> String {
     "https://chatgpt.com/backend-api/codex".into()
@@ -207,7 +207,7 @@ impl Config {
             .map(|inbound| (Arc::from(inbound.user.as_str()), inbound.weekly_credits))
             .collect();
         let ledger = Ledger::open(&self.database, weekly_credits).await?;
-        let observer = Arc::new(CodexObserver::new(ledger.clone()));
+        let observer = Arc::new(CodexObserver::new(ledger.clone())?);
         let mut managers: HashMap<PathBuf, (String, CredentialManager)> = HashMap::new();
         for outbound in self.outbounds {
             let credentials = if let Some(path) = &outbound.auth_file {

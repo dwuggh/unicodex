@@ -227,7 +227,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn late_sse_database_failure_retains_context_outside_dispatch() {
+    async fn late_sse_accounting_failure_retains_context_and_preserves_response() {
         use crate::{
             ledger::Ledger,
             proxy::{Observer, codex::stat::CodexObserver},
@@ -235,12 +235,7 @@ pub(crate) mod tests {
         use http_body_util::BodyExt;
         use tracing::{Instrument, instrument::WithSubscriber};
 
-        let ledger = Ledger::from_pool(
-            sqlx::sqlite::SqlitePoolOptions::new()
-                .max_connections(1)
-                .connect("sqlite::memory:")
-                .await
-                .unwrap(),
+        let ledger = Ledger::in_memory(
             [(
                 std::sync::Arc::from("Alice"),
                 crate::ledger::WeeklyCredits::Limited(rust_decimal::Decimal::ONE),
@@ -250,7 +245,7 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
-        let observer = Arc::new(CodexObserver::new(ledger.clone()));
+        let observer = Arc::new(CodexObserver::new(ledger.clone()).unwrap());
         let capture = Capture::default();
         let response = async {
             let req = Request::builder()
@@ -261,7 +256,7 @@ pub(crate) mod tests {
                 let response = Response::builder()
                     .header("content-type", "text/event-stream")
                     .body(Body::from(
-                        "data: {\"usage\":{\"total_tokens\":1},\"output\":\"hidden-payload\"}\n\n",
+                        "data: {\"model\":\"gpt-6.1-sol\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1},\"output\":\"hidden-payload\"}\n\n",
                     ))
                     .unwrap();
                 let result = observer
@@ -277,9 +272,9 @@ pub(crate) mod tests {
         .with_subscriber(capture.subscriber("warn,unicodex=debug"))
         .await;
         assert!(!capture.text().contains("response body failed"));
-        ledger.pool.close().await;
+        ledger.execute("DROP TABLE credit_entries").await;
         // No subscriber is installed here; the body must retain its own context.
-        assert!(response.into_body().collect().await.is_err());
+        assert!(response.into_body().collect().await.is_ok());
         let logs = capture.text();
         let ready = logs
             .lines()
@@ -287,12 +282,12 @@ pub(crate) mod tests {
             .unwrap();
         let failed = logs
             .lines()
-            .find(|line| line.contains("response body failed"))
+            .find(|line| line.contains("record_charge_failed"))
             .unwrap();
         assert!(ready.contains("status=200"));
-        assert!(failed.contains("ERROR"));
+        assert!(failed.contains("WARN"));
         assert_eq!(request_id(ready), request_id(failed));
-        assert!(logs.contains("record_observation"));
+        assert!(logs.contains("record_charge"));
         assert!(!logs.contains("hidden"));
     }
 

@@ -1,0 +1,78 @@
+# OpenAI Codex credit rates. API dollar pricing and included subscription limits
+# use different rules. Rates are decimal strings for exact arithmetic.
+version: 1
+verified_on: "2026-10-05"
+sources:
+  pricing: https://learn.chatgpt.com/docs/pricing
+  speed: https://learn.chatgpt.com/docs/agent-configuration/speed
+
+unit: credits
+tokens_per_unit: 1000000
+base_speed: standard
+
+# Apply only when the selected model supports the speed mode. These are paid
+# credit multipliers; the subscription-limit multipliers (2.5 and 8) do not apply.
+speed_multipliers:
+  standard: "1"
+  fast: "2"
+  ultrafast:
+    gpt-6-astra: "6"
+
+# input_tokens includes cached_tokens. For each model/token modality:
+# credits = ((input_tokens - cached_tokens) * input
+#          + cached_tokens * cached_input
+#          + output_tokens * output) / tokens_per_unit * speed_multiplier
+# Cache writes use the ordinary input rate, with no additional write charge.
+# Unknown models, access programs, tiers, or token modalities have no fallback rate.
+
+models:
+  gpt-6-astra:
+    input: "250"
+    cached_input: "25"
+    output: "1250"
+  gpt-6.1-sol:
+    input: "50"
+    cached_input: "2.5"
+    output: "250"
+  gpt-6-sol:
+    input: "50"
+    cached_input: "5"
+    output: "250"
+  gpt-6-luna:
+    input: "2.5"
+    cached_input: "0.25"
+    output: "12.5"
+  gpt-5.6-sol:
+    # Promotional rates published as available at least through 2026-11-21.
+    input: "100"
+    cached_input: "10"
+    output: "500"
+  gpt-5.6-terra:
+    input: "50"
+    cached_input: "5"
+    output: "300"
+  gpt-5.6-luna:
+    input: "5"
+    cached_input: "0.5"
+    output: "30"
+  gpt-rosalind-research:
+    input: "125"
+    cached_input: "12.5"
+    output: "625"
+  gpt-5.5:
+    input: "125"
+    cached_input: "12.5"
+    output: "750"
+
+# Daybreak is an access program, not a model alias. Codex sends these names in
+# access_programs.cyber. Keep its published rates separate from model prices.
+access_programs:
+  daybreak_blue:
+    input: "100"
+    cached_input: "10"
+    output: "500"
+  daybreak_red:
+    input: "312.5"
+    cached_input: "31.25"
+    output: "1875"
+

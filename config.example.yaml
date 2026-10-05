@@ -2,7 +2,8 @@ server:
   listen: "127.0.0.1:8787"
 
 # Relative file paths are resolved against this configuration file's directory.
-database: unicodex.sqlite3
+# Use a fresh file when upgrading from the legacy SQLite/JSON ledger.
+database: unicodex.turso.db
 
 inbounds:
   - id: alice-route
@@ -16,7 +17,7 @@ inbounds:
     user: Bob
     type: codex
     key: "choose-another-local-secret"
-    # No local quota; preserve upstream status and record usage best-effort.
+    # No local quota; preserve upstream status and record calculated credits best-effort.
     weekly_credits: "unlimited"
 
 outbounds:

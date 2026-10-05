@@ -135,7 +135,7 @@ pub trait Observer: Send + Sync + 'static {
         response: Response,
     ) -> impl Future<Output = anyhow::Result<Response>> + Send + 'static;
 
-    /// Persist original reports without replacing message bytes or their type.
+    /// Observe accounting without replacing message bytes or their type.
     fn observe_ws<'a>(
         &'a self,
         user: &'a str,

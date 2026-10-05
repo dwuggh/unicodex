@@ -4,6 +4,7 @@ pub mod app;
 pub mod config;
 pub mod ledger;
 pub mod logging;
+pub mod pricing;
 pub mod proxy;
 
 // Count allocations only on the measuring test's thread. Production uses its normal allocator.
