@@ -1,0 +1,6 @@
+- automate weekly limit reset (by detecting change in reset date?)
+- rpc
+  - get user info
+  - adjust user's rate limit at runtime
+- investigate chatgpt's behaviour, by whistle
+- fix misbehaviours in limited mode
