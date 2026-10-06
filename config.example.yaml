@@ -2,7 +2,6 @@ server:
   listen: "127.0.0.1:8787"
 
 # Relative file paths are resolved against this configuration file's directory.
-# Use a fresh file when upgrading from the legacy SQLite/JSON ledger.
 database: unicodex.turso.db
 
 inbounds:

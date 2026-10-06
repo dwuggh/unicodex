@@ -2657,14 +2657,11 @@ dependencies = [
  "index_vec",
  "indexmap",
  "inventory",
- "serde",
  "toasty-core",
  "toasty-driver-turso",
  "toasty-macros",
  "tokio",
  "tokio-stream",
- "toml",
- "toml_edit",
  "tracing",
  "uuid",
 ]
@@ -2827,11 +2824,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1340ea94a5856333492c9064b02c778b191dd2c853778d9609debdcdfea3a614"
 dependencies = [
  "indexmap",
- "serde_core",
- "serde_spanned",
  "toml_datetime",
  "toml_parser",
- "toml_writer",
  "winnow",
 ]
 

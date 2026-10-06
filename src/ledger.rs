@@ -4,7 +4,6 @@ use anyhow::{Context, ensure};
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use toasty::{
     Db,
-    migration::{MigrationFile, MigrationSet},
     stmt::{Type, Value},
 };
 use toasty_driver_turso::Turso;
@@ -12,11 +11,6 @@ use toasty_driver_turso::Turso;
 use crate::proxy::{Admission, ProxyError};
 
 const CREDIT_SCALE: i64 = 1_000_000_000;
-const MIGRATIONS: MigrationSet = MigrationSet::new(&[MigrationFile::new(
-    1,
-    "0000_credit_entries.sql",
-    include_str!("../migrations/0000_credit_entries.sql"),
-)]);
 
 /// Exact nonnegative credits in billionths. Construction validates precision and range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,24 +103,14 @@ impl Ledger {
             .build(driver)
             .await?;
         let tables = toasty::sql::query(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'credit_entries'",
         )
         .exec(&mut db)
         .await?;
-        let compatible = tables.iter().any(|row| matches!(row, Value::Record(fields) if fields[0] == Value::String("__toasty_migrations".into())));
-        if !tables.is_empty() && !compatible {
-            tracing::error!(
-                operation = "open_ledger",
-                reason = "incompatible_database",
-                "configure a fresh database path, for example unicodex.turso.db; existing data was not changed"
-            );
+        if tables.is_empty() {
+            db.push_schema().await?;
         }
-        ensure!(
-            tables.is_empty() || compatible,
-            "incompatible database; configure a fresh database path (for example unicodex.turso.db)"
-        );
-        MIGRATIONS.apply(&db).await?;
-        // Validate the schema on restart without resetting or dropping existing data.
+        // Opening an existing ledger never rewrites its schema or stored charges.
         toasty::sql::query("SELECT id, timestamp, user, credits FROM credit_entries LIMIT 0")
             .exec(&mut db)
             .await?;
@@ -316,7 +300,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_preserves_charges_and_migrations_are_idempotent() {
+    async fn restart_preserves_charges_without_schema_tracking() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("ledger.db");
         let ledger = Ledger::open(&path, Default::default()).await.unwrap();
@@ -342,7 +326,24 @@ mod tests {
                 .unwrap(),
             Decimal::new(125, 3)
         );
-        assert_eq!(MIGRATIONS.apply(&ledger.db).await.unwrap().skipped(), 1);
+        ledger
+            .record_charge("Alice", amount("0.125"))
+            .await
+            .unwrap();
+        let entries = ledger.entries().await;
+        assert_eq!(entries.len(), 2);
+        assert_ne!(entries[0].id, entries[1].id);
+        // Turso may keep an internal sequence table for the automatic primary key.
+        let tables = toasty::sql::query(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT GLOB 'sqlite_*' AND name NOT GLOB '__turso_internal_*'",
+        )
+        .exec(&mut ledger.db.clone())
+        .await
+        .unwrap();
+        assert_eq!(tables.len(), 1, "{tables:?}");
+        assert!(
+            matches!(&tables[0], Value::Record(fields) if fields[0] == Value::String("credit_entries".into()))
+        );
     }
 
     #[tokio::test]
@@ -412,25 +413,5 @@ mod tests {
             Err(ProxyError::Internal(_))
         ));
         assert!(ledger.check("Bob", None).await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn legacy_database_is_rejected_without_deleting_it() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("old.db");
-        let mut db = Db::builder().build(Turso::file(&path)).await.unwrap();
-        toasty::sql::statement("CREATE TABLE observations (usage TEXT)")
-            .exec(&mut db)
-            .await
-            .unwrap();
-        drop(db);
-        assert!(Ledger::open(&path, Default::default()).await.is_err());
-        let mut db = Db::builder().build(Turso::file(&path)).await.unwrap();
-        assert!(
-            toasty::sql::query("SELECT usage FROM observations")
-                .exec(&mut db)
-                .await
-                .is_ok()
-        );
     }
 }
